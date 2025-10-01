@@ -1,5 +1,5 @@
 script.js
-// Node 20+ (has global fetch). Env needed: NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID
+// Node 20+ (global fetch). Env: NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID
 const NOTION_API = "https://api.notion.com/v1";
 const NOTION_VER = "2022-06-28";
 const H = {
@@ -9,16 +9,21 @@ const H = {
 };
 const nowISO = () => new Date().toISOString();
 
-// --- Notion helpers ---
-async function notionQueryUnscored(dbId) {
-  const body = { page_size: 50, filter: { property: "Last Scored", date: { is_empty: true } } };
-  const r = await fetch(`${NOTION_API}/databases/${dbId}/query`, { method: "POST", headers: H, body: JSON.stringify(body) });
-  if (!r.ok) throw new Error(`Notion query failed: ${r.status} ${await r.text()}`);
-  return (await r.json()).results || [];
+function hasEnv() {
+  return {
+    NOTION_TOKEN: !!process.env.NOTION_TOKEN,
+    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
+    ACCOUNTS_DB_ID: !!process.env.ACCOUNTS_DB_ID,
+    DISQUALIFIED_DB_ID: !!process.env.DISQUALIFIED_DB_ID,
+  };
 }
+
 function getTitle(page) {
-  for (const v of Object.values(page.properties)) if (v.type === "title")
-    return (v.title || []).map(t => t.plain_text).join(" ").trim();
+  for (const v of Object.values(page.properties || {})) {
+    if (v?.type === "title") {
+      return (v.title || []).map(t => t.plain_text).join(" ").trim();
+    }
+  }
   return "";
 }
 function getProp(page, name) {
@@ -28,12 +33,40 @@ function getProp(page, name) {
   if (p.type === "rich_text") return (p.rich_text || []).map(t => t.plain_text).join(" ").trim();
   if (p.type === "select") return p.select?.name || "";
   if (p.type === "multi_select") return (p.multi_select || []).map(s => s.name).join(", ");
+  if (p.type === "date") return p.date?.start || "";
   return "";
 }
+
+async function notionQueryUnscored(dbId) {
+  // Try filtering by "Last Scored is empty"
+  const body = { page_size: 50, filter: { property: "Last Scored", date: { is_empty: true } } };
+  let r = await fetch(`${NOTION_API}/databases/${dbId}/query`, { method: "POST", headers: H, body: JSON.stringify(body) });
+  if (r.ok) {
+    const j = await r.json();
+    return j.results || [];
+  }
+  // If the filter failed (e.g., property doesn't exist), fall back to unfiltered query
+  const text = await r.text();
+  console.warn("[notionQueryUnscored] Filtered query failed, falling back. Status:", r.status, text);
+  r = await fetch(`${NOTION_API}/databases/${dbId}/query`, { method: "POST", headers: H, body: JSON.stringify({ page_size: 50 }) });
+  if (!r.ok) {
+    const t2 = await r.text();
+    throw new Error(`Notion unfiltered query failed: ${r.status} ${t2}`);
+  }
+  const j2 = await r.json();
+  const results = j2.results || [];
+  // Client-side filter: pick pages where Last Scored is missing or empty
+  return results.filter(p => !getProp(p, "Last Scored"));
+}
+
 async function notionUpdatePage(pageId, properties) {
   const r = await fetch(`${NOTION_API}/pages/${pageId}`, { method: "PATCH", headers: H, body: JSON.stringify({ properties }) });
-  if (!r.ok) throw new Error(`Notion update failed: ${r.status} ${await r.text()}`);
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Notion update failed: ${r.status} ${t}`);
+  }
 }
+
 async function notionCreateDisqualified(disqDbId, { name, website, reason, sourceUrl }) {
   const properties = {
     "Name": { title: [{ type: "text", text: { content: name || "(unknown)" } }] },
@@ -42,17 +75,22 @@ async function notionCreateDisqualified(disqDbId, { name, website, reason, sourc
   };
   if (website) properties["Website"] = { url: website };
   if (sourceUrl) properties["Source Page URL"] = { url: sourceUrl };
+
   const r = await fetch(`${NOTION_API}/pages`, {
-    method: "POST", headers: H, body: JSON.stringify({ parent: { database_id: disqDbId }, properties })
+    method: "POST",
+    headers: H,
+    body: JSON.stringify({ parent: { database_id: disqDbId }, properties })
   });
-  if (!r.ok) throw new Error(`Create disqualified failed: ${r.status} ${await r.text()}`);
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`Create disqualified failed: ${r.status} ${t}`);
+  }
 }
 
-// --- OpenAI call ---
 async function scoreWithGPT({ name, website }) {
   const system = `You are a B2B medtech ICP evaluator. Return ONLY JSON per schema. No explanations.`;
   const user = `
-ICP (edit these bullets if you want to specialize):
+ICP:
 - industries: medtech, digital health, diagnostics
 - geos: US, EU
 - personas: CEO/Founder, Commercial Lead, VP Sales/Marketing, Head of BD
@@ -75,46 +113,88 @@ Return ONLY:
       messages: [{ role: "system", content: system }, { role: "user", content: user }]
     })
   });
-  if (!r.ok) throw new Error(`OpenAI failed: ${r.status} ${await r.text()}`);
-  const content = (await r.json()).choices[0].message.content;
-  try { return JSON.parse(content); } catch { return { verdict: "Not ICP", reason: "Invalid JSON", disqualifiers: ["parse error"] }; }
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`OpenAI failed: ${r.status} ${t}`);
+  }
+  const content = (await r.json()).choices?.[0]?.message?.content || "{}";
+  let out;
+  try { out = JSON.parse(content); } catch { out = null; }
+  if (!out || typeof out !== "object") {
+    return { verdict: "Not ICP", reason: "Invalid JSON", disqualifiers: ["parse error"] };
+  }
+  return out;
 }
 
-// --- Main ---
 (async () => {
+  console.log("Env check:", hasEnv());
   const { NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID } = process.env;
   if (!NOTION_TOKEN || !OPENAI_API_KEY || !ACCOUNTS_DB_ID || !DISQUALIFIED_DB_ID) {
-    throw new Error("Missing env: NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID");
+    console.error("Missing one or more env vars. Aborting.");
+    process.exit(1);
   }
 
-  const pages = await notionQueryUnscored(ACCOUNTS_DB_ID);
+  let pages = [];
+  try {
+    pages = await notionQueryUnscored(ACCOUNTS_DB_ID);
+  } catch (e) {
+    console.error("Failed to list Accounts DB pages:", String(e));
+    process.exit(1);
+  }
+
+  console.log(`Found ${pages.length} unscored page(s).`);
+  let failures = 0;
+
   for (const page of pages) {
+    const pageId = page.id;
     const name = getTitle(page);
     const website = getProp(page, "Website");
     const sourceUrl = page.url;
 
-    const { verdict = "Not ICP", reason = "", disqualifiers = [] } = await scoreWithGPT({ name, website });
-    const notICP = (verdict || "").toLowerCase().includes("not icp");
-
-    // Build update props. "Last Scored" MUST exist; others are optional.
-    const updates = { "Last Scored": { date: { start: nowISO() } } };
-    // Optional properties (script tries them; if they don't exist, we fall back below)
-    if ("Tier Recommendation" in page.properties) updates["Tier Recommendation"] = { select: { name: notICP ? "Not ICP" : "Qualified" } };
-    if ("Reason" in page.properties) updates["Reason"] = { rich_text: [{ type: "text", text: { content: reason } }] };
-
     try {
-      await notionUpdatePage(page.id, updates);
-    } catch {
-      // Fallback to only Last Scored (works even if optional props missing)
-      await notionUpdatePage(page.id, { "Last Scored": { date: { start: nowISO() } } });
-    }
+      const { verdict = "Not ICP", reason = "", disqualifiers = [] } = await scoreWithGPT({ name, website });
+      const notICP = (verdict || "").toLowerCase().includes("not icp");
 
-    if (notICP) {
-      await notionCreateDisqualified(DISQUALIFIED_DB_ID, {
-        name, website, reason: reason || disqualifiers.join("; "), sourceUrl
-      });
+      // Build updates; Last Scored always present in our logic
+      const updates = { "Last Scored": { date: { start: nowISO() } } };
+
+      // Optional props only if they exist on the page
+      if (page.properties && Object.prototype.hasOwnProperty.call(page.properties, "Tier Recommendation")) {
+        updates["Tier Recommendation"] = { select: { name: notICP ? "Not ICP" : "Qualified" } };
+      }
+      if (page.properties && Object.prototype.hasOwnProperty.call(page.properties, "Reason")) {
+        updates["Reason"] = { rich_text: [{ type: "text", text: { content: reason } }] };
+      }
+
+      try {
+        await notionUpdatePage(pageId, updates);
+      } catch (e) {
+        console.warn(`Update with optional props failed for ${name}. Retrying with Last Scored only.`, String(e));
+        await notionUpdatePage(pageId, { "Last Scored": { date: { start: nowISO() } } });
+      }
+
+      if (notICP) {
+        await notionCreateDisqualified(DISQUALIFIED_DB_ID, {
+          name,
+          website,
+          reason: reason || (disqualifiers || []).join("; "),
+          sourceUrl
+        });
+      }
+
+      console.log(`${name}: ${verdict}`);
+    } catch (e) {
+      failures++;
+      console.error(`Error processing "${name}":`, String(e));
+      // Continue with the next page
     }
-    console.log(`${name}: ${verdict}`);
   }
-  console.log(`Processed ${pages.length} account(s).`);
-})().catch(e => { console.error(e); process.exit(1); });
+
+  console.log(`Done. Success: ${pages.length - failures}, Failed: ${failures}`);
+  // Do not fail the whole job if some rows error
+  process.exit(0);
+})().catch(e => {
+  console.error("Fatal error:", String(e));
+  process.exit(1);
+});
+
