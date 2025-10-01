@@ -1,5 +1,9 @@
 script.js
-// Node 20+ (global fetch). Env: NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID
+// Node 20+ (global fetch available).
+// REQUIRED repo secrets: NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID
+
+const crypto = require('crypto');
+
 const NOTION_API = "https://api.notion.com/v1";
 const NOTION_VER = "2022-06-28";
 const H = {
@@ -7,22 +11,80 @@ const H = {
   "Notion-Version": NOTION_VER,
   "Content-Type": "application/json"
 };
+
 const nowISO = () => new Date().toISOString();
 
-function hasEnv() {
-  return {
+// ===== YOUR ICP PROMPT (hard-coded) =====
+const ICP_VERSION = "v1-pathova-framework";
+const ICP_TEXT = `
+<SYSTEM_ROLE>
+You are a **Critical B2B Healthcare Commercial Analyst** specializing in rigorous Ideal Customer Profile (ICP) qualification for strategic sales. Your analysis must be evidence-based and skeptical, strictly following the defined ICP Qualification Framework found in the Notion Sales HQ.
+</SYSTEM_ROLE>
+
+<REASONING_NUDGE>
+**Think deeply and be extremely thorough.** Apply the full TIER 1, TIER 2, and TIER 3 rubrics (from the internal framework) sequentially. Internally score your analysis against a 5-criterion rubric and **iterate until you achieve top marks** before outputting the final result.
+</REASONING_NUDGE>
+
+<TASK>
+Your mandate is to mine the internal Notion Sales HQ and public sources (if permitted by Notion context) to provide a comprehensive ICP Fit Determination. This determination must be quantified, verifiable, and strictly adhere to the scoring system and disqualifiers defined in the ICP Framework.
+</TASK>
+
+<INPUT_DATA>
+**Company:** {{NAME}}
+**Key Contact:** {{CONTACT}}
+**Notion_Prospect_Page_Link:** {{PROSPECT_LINK}}
+</INPUT_DATA>
+
+<NOTION_ANALYSIS_REQUIRED>
+The analysis must specifically leverage and cross-reference intelligence from the following Notion Sales HQ assets:
+1. **ICP Qualification Framework:** Apply the exact point criteria (Tier 1: Core Fit, Tier 2: MEDDIC, Tier 3: Pathova-Specific Fit) [6, 10, 14].
+2. **Buyer Persona Frameworks:** Cross-reference the Key Contact against relevant personas (e.g., "Technical Founder," "Commercial Leader") [8, 22].
+3. **Disqualifiers Check:** Verify the prospect against all critical disqualifiers listed in TIER 3 [15].
+4. **Evidence Database:** Search the \`@Evidence Database\` and \`@Successful Outreach\` logs for applicable proof points or similar company patterns [23, 24].
+</NOTION_ANALYSIS_REQUIRED>
+
+<OUTPUT_REQUIRED>
+Generate a structured report, adhering to the framework structure and scoring criteria:
+
+1. **Overall ICP Score:** [__ / 30 points]
+2. **ICP Tier Classification:** (Tier 1: Immediate Priority, Tier 2: Qualified Pipeline, Tier 3: Long-term Development, or Non-ICP) [17].
+3. **Detailed Tier Scoring Table:** (Show scores for Tier 1, 2, and 3, including confidence calibration for each tier [16]).
+4. **Primary Disqualification Check:** (State YES/NO and cite the specific disqualifier [15, 16]).
+5. **Next Actions:** Provide **2-3 evidence-based next steps** prioritized by urgency, aligning with the recommendations for the identified Tier [17, 18].
+6. **Evidence Map:** List all required **Evidence** or mark as "UNVERIFIED" for Tier 1 (Company Profile and Commercial Gap Indicators) [7, 8].
+7. **Assumptions & Data Gaps:** List explicitly all unverified assumptions, referencing the framework criteria they violate [10, 17].
+</OUTPUT_REQUIRED>
+
+<CONSTRAINTS>
+**Citation Rule:** Every score >0 must have a cited source [20]. Cite internal sources using the provided link template or Notion Page Name [25].
+**Confidence Calibration:** Use HIGH (2+ primary sources confirm), MEDIUM, or LOW (Single source or inference) [21].
+**Vagueness Guardrail:** Flag all inferences and assumptions explicitly [21].
+**Disqualification:** If any disqualifier is confirmed, immediately halt scoring and output "Non-ICP" [16].
+</CONSTRAITS>
+
+<PERFECTION_LOOP>
+Create an internal 5-criterion rubric based on the prompt constraints (Framework Adherence, Verifiable Scoring, Confidence Calibration, Disqualification Check, Clarity of Next Actions). **Internally iterate and refine the analysis until it scores top marks (10/10) against this rubric. Output only the final result.**
+</PERFECTION_LOOP>
+`.trim();
+
+const ICP_HASH = crypto.createHash('sha256').update(ICP_TEXT).digest('hex').slice(0, 12);
+console.log(`Using ICP ${ICP_VERSION} (${ICP_HASH})`);
+
+// ===== Utilities =====
+function envCheck() {
+  const ok = {
     NOTION_TOKEN: !!process.env.NOTION_TOKEN,
     OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
     ACCOUNTS_DB_ID: !!process.env.ACCOUNTS_DB_ID,
-    DISQUALIFIED_DB_ID: !!process.env.DISQUALIFIED_DB_ID,
+    DISQUALIFIED_DB_ID: !!process.env.DISQUALIFIED_DB_ID
   };
+  console.log("Env check:", ok);
+  return Object.values(ok).every(Boolean);
 }
 
 function getTitle(page) {
   for (const v of Object.values(page.properties || {})) {
-    if (v?.type === "title") {
-      return (v.title || []).map(t => t.plain_text).join(" ").trim();
-    }
+    if (v?.type === "title") return (v.title || []).map(t => t.plain_text).join(" ").trim();
   }
   return "";
 }
@@ -37,70 +99,74 @@ function getProp(page, name) {
   return "";
 }
 
+// ===== Notion I/O =====
 async function notionQueryUnscored(dbId) {
-  // Try filtering by "Last Scored is empty"
-  const body = { page_size: 50, filter: { property: "Last Scored", date: { is_empty: true } } };
-  let r = await fetch(`${NOTION_API}/databases/${dbId}/query`, { method: "POST", headers: H, body: JSON.stringify(body) });
-  if (r.ok) {
-    const j = await r.json();
-    return j.results || [];
-  }
-  // If the filter failed (e.g., property doesn't exist), fall back to unfiltered query
-  const text = await r.text();
-  console.warn("[notionQueryUnscored] Filtered query failed, falling back. Status:", r.status, text);
-  r = await fetch(`${NOTION_API}/databases/${dbId}/query`, { method: "POST", headers: H, body: JSON.stringify({ page_size: 50 }) });
-  if (!r.ok) {
-    const t2 = await r.text();
-    throw new Error(`Notion unfiltered query failed: ${r.status} ${t2}`);
-  }
-  const j2 = await r.json();
-  const results = j2.results || [];
-  // Client-side filter: pick pages where Last Scored is missing or empty
-  return results.filter(p => !getProp(p, "Last Scored"));
+  // Prefer: "Last Scored is empty"
+  let r = await fetch(`${NOTION_API}/databases/${dbId}/query`, {
+    method: "POST", headers: H,
+    body: JSON.stringify({ page_size: 50, filter: { property: "Last Scored", date: { is_empty: true } } })
+  });
+  if (r.ok) return (await r.json()).results || [];
+
+  // Fallback: unfiltered + client-side filter
+  console.warn("[notionQueryUnscored] Filtered query failed, falling back:", r.status, await r.text());
+  r = await fetch(`${NOTION_API}/databases/${dbId}/query`, {
+    method: "POST", headers: H, body: JSON.stringify({ page_size: 50 })
+  });
+  if (!r.ok) throw new Error(`Notion unfiltered query failed: ${r.status} ${await r.text()}`);
+  const all = (await r.json()).results || [];
+  return all.filter(p => !getProp(p, "Last Scored"));
 }
 
 async function notionUpdatePage(pageId, properties) {
-  const r = await fetch(`${NOTION_API}/pages/${pageId}`, { method: "PATCH", headers: H, body: JSON.stringify({ properties }) });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Notion update failed: ${r.status} ${t}`);
-  }
+  const r = await fetch(`${NOTION_API}/pages/${pageId}`, {
+    method: "PATCH", headers: H, body: JSON.stringify({ properties })
+  });
+  if (!r.ok) throw new Error(`Notion update failed: ${r.status} ${await r.text()}`);
 }
 
 async function notionCreateDisqualified(disqDbId, { name, website, reason, sourceUrl }) {
-  const properties = {
+  const props = {
     "Name": { title: [{ type: "text", text: { content: name || "(unknown)" } }] },
     "Reason": { rich_text: [{ type: "text", text: { content: reason || "" } }] },
     "Date": { date: { start: nowISO() } }
   };
-  if (website) properties["Website"] = { url: website };
-  if (sourceUrl) properties["Source Page URL"] = { url: sourceUrl };
+  if (website) props["Website"] = { url: website };
+  if (sourceUrl) props["Source Page URL"] = { url: sourceUrl };
 
   const r = await fetch(`${NOTION_API}/pages`, {
-    method: "POST",
-    headers: H,
-    body: JSON.stringify({ parent: { database_id: disqDbId }, properties })
+    method: "POST", headers: H,
+    body: JSON.stringify({ parent: { database_id: disqDbId }, properties: props })
   });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Create disqualified failed: ${r.status} ${t}`);
-  }
+  if (!r.ok) throw new Error(`Create disqualified failed: ${r.status} ${await r.text()}`);
 }
 
+// ===== OpenAI call =====
 async function scoreWithGPT({ name, website }) {
-  const system = `You are a B2B medtech ICP evaluator. Return ONLY JSON per schema. No explanations.`;
+  // System keeps model honest: JSON only; no browsing; no CoT leakage.
+  const system = `You are a B2B medtech ICP evaluator. Work ONLY with data provided here. Return ONLY JSON per schema. No explanations.`;
+
+  // We inject your full ICP prompt, substitute values, and then force a simple JSON schema
   const user = `
-ICP:
-- industries: medtech, digital health, diagnostics
-- geos: US, EU
-- personas: CEO/Founder, Commercial Lead, VP Sales/Marketing, Head of BD
-- disqualifiers: agency/consultancy; non-healthcare; <50 employees (non-startup); no GTM staff; student/academic
+${ICP_TEXT}
 
-Prospect:
+<DATA_SUBSTITUTIONS>
+{{NAME}} = "${name}"
+{{CONTACT}} = ""
+{{PROSPECT_LINK}} = ""
+</DATA_SUBSTITUTIONS>
+
+<PROSPECT_MINIMAL>
 {"name":"${name}","website":"${website}"}
+</PROSPECT_MINIMAL>
 
-Return ONLY:
-{"verdict":"Qualified|Not ICP","reason":"<=280 chars","disqualifiers":["..."]}
+<RETURN_JSON_ONLY>
+{
+  "verdict":"Qualified|Not ICP",
+  "reason":"<=280 chars",
+  "disqualifiers":["..."]
+}
+</RETURN_JSON_ONLY>
 `.trim();
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -113,30 +179,21 @@ Return ONLY:
       messages: [{ role: "system", content: system }, { role: "user", content: user }]
     })
   });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`OpenAI failed: ${r.status} ${t}`);
-  }
+  if (!r.ok) throw new Error(`OpenAI failed: ${r.status} ${await r.text()}`);
   const content = (await r.json()).choices?.[0]?.message?.content || "{}";
-  let out;
-  try { out = JSON.parse(content); } catch { out = null; }
-  if (!out || typeof out !== "object") {
-    return { verdict: "Not ICP", reason: "Invalid JSON", disqualifiers: ["parse error"] };
-  }
-  return out;
+  try { return JSON.parse(content); } catch { return { verdict: "Not ICP", reason: "Invalid JSON", disqualifiers: ["parse error"] }; }
 }
 
+// ===== Main =====
 (async () => {
-  console.log("Env check:", hasEnv());
-  const { NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID } = process.env;
-  if (!NOTION_TOKEN || !OPENAI_API_KEY || !ACCOUNTS_DB_ID || !DISQUALIFIED_DB_ID) {
+  if (!envCheck()) {
     console.error("Missing one or more env vars. Aborting.");
     process.exit(1);
   }
 
   let pages = [];
   try {
-    pages = await notionQueryUnscored(ACCOUNTS_DB_ID);
+    pages = await notionQueryUnscored(process.env.ACCOUNTS_DB_ID);
   } catch (e) {
     console.error("Failed to list Accounts DB pages:", String(e));
     process.exit(1);
@@ -155,15 +212,20 @@ Return ONLY:
       const { verdict = "Not ICP", reason = "", disqualifiers = [] } = await scoreWithGPT({ name, website });
       const notICP = (verdict || "").toLowerCase().includes("not icp");
 
-      // Build updates; Last Scored always present in our logic
+      // Build updates. "Last Scored" should exist; optional fields written only if present.
       const updates = { "Last Scored": { date: { start: nowISO() } } };
-
-      // Optional props only if they exist on the page
       if (page.properties && Object.prototype.hasOwnProperty.call(page.properties, "Tier Recommendation")) {
         updates["Tier Recommendation"] = { select: { name: notICP ? "Not ICP" : "Qualified" } };
       }
       if (page.properties && Object.prototype.hasOwnProperty.call(page.properties, "Reason")) {
         updates["Reason"] = { rich_text: [{ type: "text", text: { content: reason } }] };
+      }
+      // Optional: record the prompt signature if you add these fields in Notion
+      if (page.properties && Object.prototype.hasOwnProperty.call(page.properties, "ICP Version")) {
+        updates["ICP Version"] = { rich_text: [{ type: "text", text: { content: ICP_VERSION } }] };
+      }
+      if (page.properties && Object.prototype.hasOwnProperty.call(page.properties, "ICP Hash")) {
+        updates["ICP Hash"] = { rich_text: [{ type: "text", text: { content: ICP_HASH } }] };
       }
 
       try {
@@ -174,7 +236,7 @@ Return ONLY:
       }
 
       if (notICP) {
-        await notionCreateDisqualified(DISQUALIFIED_DB_ID, {
+        await notionCreateDisqualified(process.env.DISQUALIFIED_DB_ID, {
           name,
           website,
           reason: reason || (disqualifiers || []).join("; "),
@@ -186,15 +248,13 @@ Return ONLY:
     } catch (e) {
       failures++;
       console.error(`Error processing "${name}":`, String(e));
-      // Continue with the next page
+      // continue to next page
     }
   }
 
   console.log(`Done. Success: ${pages.length - failures}, Failed: ${failures}`);
-  // Do not fail the whole job if some rows error
-  process.exit(0);
+  process.exit(0); // do not fail the whole job if some rows error
 })().catch(e => {
   console.error("Fatal error:", String(e));
   process.exit(1);
 });
-
