@@ -1,0 +1,120 @@
+script.js
+// Node 20+ (has global fetch). Env needed: NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID
+const NOTION_API = "https://api.notion.com/v1";
+const NOTION_VER = "2022-06-28";
+const H = {
+  "Authorization": `Bearer ${process.env.NOTION_TOKEN}`,
+  "Notion-Version": NOTION_VER,
+  "Content-Type": "application/json"
+};
+const nowISO = () => new Date().toISOString();
+
+// --- Notion helpers ---
+async function notionQueryUnscored(dbId) {
+  const body = { page_size: 50, filter: { property: "Last Scored", date: { is_empty: true } } };
+  const r = await fetch(`${NOTION_API}/databases/${dbId}/query`, { method: "POST", headers: H, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`Notion query failed: ${r.status} ${await r.text()}`);
+  return (await r.json()).results || [];
+}
+function getTitle(page) {
+  for (const v of Object.values(page.properties)) if (v.type === "title")
+    return (v.title || []).map(t => t.plain_text).join(" ").trim();
+  return "";
+}
+function getProp(page, name) {
+  const p = page.properties?.[name];
+  if (!p) return "";
+  if (p.type === "url") return p.url || "";
+  if (p.type === "rich_text") return (p.rich_text || []).map(t => t.plain_text).join(" ").trim();
+  if (p.type === "select") return p.select?.name || "";
+  if (p.type === "multi_select") return (p.multi_select || []).map(s => s.name).join(", ");
+  return "";
+}
+async function notionUpdatePage(pageId, properties) {
+  const r = await fetch(`${NOTION_API}/pages/${pageId}`, { method: "PATCH", headers: H, body: JSON.stringify({ properties }) });
+  if (!r.ok) throw new Error(`Notion update failed: ${r.status} ${await r.text()}`);
+}
+async function notionCreateDisqualified(disqDbId, { name, website, reason, sourceUrl }) {
+  const properties = {
+    "Name": { title: [{ type: "text", text: { content: name || "(unknown)" } }] },
+    "Reason": { rich_text: [{ type: "text", text: { content: reason || "" } }] },
+    "Date": { date: { start: nowISO() } }
+  };
+  if (website) properties["Website"] = { url: website };
+  if (sourceUrl) properties["Source Page URL"] = { url: sourceUrl };
+  const r = await fetch(`${NOTION_API}/pages`, {
+    method: "POST", headers: H, body: JSON.stringify({ parent: { database_id: disqDbId }, properties })
+  });
+  if (!r.ok) throw new Error(`Create disqualified failed: ${r.status} ${await r.text()}`);
+}
+
+// --- OpenAI call ---
+async function scoreWithGPT({ name, website }) {
+  const system = `You are a B2B medtech ICP evaluator. Return ONLY JSON per schema. No explanations.`;
+  const user = `
+ICP (edit these bullets if you want to specialize):
+- industries: medtech, digital health, diagnostics
+- geos: US, EU
+- personas: CEO/Founder, Commercial Lead, VP Sales/Marketing, Head of BD
+- disqualifiers: agency/consultancy; non-healthcare; <50 employees (non-startup); no GTM staff; student/academic
+
+Prospect:
+{"name":"${name}","website":"${website}"}
+
+Return ONLY:
+{"verdict":"Qualified|Not ICP","reason":"<=280 chars","disqualifiers":["..."]}
+`.trim();
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+      messages: [{ role: "system", content: system }, { role: "user", content: user }]
+    })
+  });
+  if (!r.ok) throw new Error(`OpenAI failed: ${r.status} ${await r.text()}`);
+  const content = (await r.json()).choices[0].message.content;
+  try { return JSON.parse(content); } catch { return { verdict: "Not ICP", reason: "Invalid JSON", disqualifiers: ["parse error"] }; }
+}
+
+// --- Main ---
+(async () => {
+  const { NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID } = process.env;
+  if (!NOTION_TOKEN || !OPENAI_API_KEY || !ACCOUNTS_DB_ID || !DISQUALIFIED_DB_ID) {
+    throw new Error("Missing env: NOTION_TOKEN, OPENAI_API_KEY, ACCOUNTS_DB_ID, DISQUALIFIED_DB_ID");
+  }
+
+  const pages = await notionQueryUnscored(ACCOUNTS_DB_ID);
+  for (const page of pages) {
+    const name = getTitle(page);
+    const website = getProp(page, "Website");
+    const sourceUrl = page.url;
+
+    const { verdict = "Not ICP", reason = "", disqualifiers = [] } = await scoreWithGPT({ name, website });
+    const notICP = (verdict || "").toLowerCase().includes("not icp");
+
+    // Build update props. "Last Scored" MUST exist; others are optional.
+    const updates = { "Last Scored": { date: { start: nowISO() } } };
+    // Optional properties (script tries them; if they don't exist, we fall back below)
+    if ("Tier Recommendation" in page.properties) updates["Tier Recommendation"] = { select: { name: notICP ? "Not ICP" : "Qualified" } };
+    if ("Reason" in page.properties) updates["Reason"] = { rich_text: [{ type: "text", text: { content: reason } }] };
+
+    try {
+      await notionUpdatePage(page.id, updates);
+    } catch {
+      // Fallback to only Last Scored (works even if optional props missing)
+      await notionUpdatePage(page.id, { "Last Scored": { date: { start: nowISO() } } });
+    }
+
+    if (notICP) {
+      await notionCreateDisqualified(DISQUALIFIED_DB_ID, {
+        name, website, reason: reason || disqualifiers.join("; "), sourceUrl
+      });
+    }
+    console.log(`${name}: ${verdict}`);
+  }
+  console.log(`Processed ${pages.length} account(s).`);
+})().catch(e => { console.error(e); process.exit(1); });
