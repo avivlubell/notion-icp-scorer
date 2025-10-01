@@ -1,0 +1,19 @@
+.github/workflows/run.yml
+name: icp-scorer
+on:
+  schedule: [{ cron: "*/10 * * * *" }]  # every 10 minutes
+  workflow_dispatch: {}                 # lets you run it on demand
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: node script.js
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ACCOUNTS_DB_ID: ${{ secrets.ACCOUNTS_DB_ID }}
+          DISQUALIFIED_DB_ID: ${{ secrets.DISQUALIFIED_DB_ID }}
