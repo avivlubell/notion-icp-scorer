@@ -1,5 +1,5 @@
 .github/workflows/run.yml
-name: icp-scorer
+name: motion-icp-scorer
 on:
   schedule: [{ cron: "*/10 * * * *" }]  # every 10 minutes
   workflow_dispatch: {}                 # lets you run it on demand
